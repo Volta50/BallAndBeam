@@ -1,0 +1,442 @@
+/*
+ * Ball and Beam - Controlador PID (ESP32)
+ * Integra:
+ *   - Control PID discreto en tarea FreeRTOS (Core 1)
+ *   - Servo via libreria ESP32Servo (writeMicroseconds)  [codigo funcional del servo]
+ *   - Sensor Sharp GP2Y0A21 con tabla de calibracion + promedio + filtro [codigo funcional del Sharp]
+ *
+ * (El VL53L0X queda fuera, ya no se usa)
+ *
+ * CORRECCIONES APLICADAS:
+ *   1. Centro del servo: era 1500, corregido a US_CENTRO = 1420 us.
+ *   2. Mapping deg->us: el codigo original asumia 1000us = 135deg (servo generico).
+ *      Medicion real de la viga: 134.78 us por cada 1 deg de inclinacion.
+ *      El error era un factor 18x (el PID pedia angulos enormes que solo
+ *      producian inclinaciones minusculas de viga).
+ *   3. Tope mecanico inferior: US_MIN_SEG subido de 700 a 950 us
+ *      (la viga satura fisicamente a ~900 us / +2.97 deg).
+ *
+ * MODO DE CALIBRACION DE FRICCION (Coulomb / stiction):
+ *   Por Serial, enviar:
+ *     'c' o 'C'  -> inicia una rampa lenta de angulo (modo lazo abierto, sin PID)
+ *                   en sentido POSITIVO, para medir el angulo de arranque de la bola.
+ *     'n' o 'N'  -> misma rampa pero en sentido NEGATIVO.
+ *     'p' o 'P'  -> vuelve al modo PID normal (cancela la rampa si esta corriendo).
+ *   El log se imprime en el MISMO formato que usa tu script de Python
+ *   (separador "TRIAL" + lineas "t,x" en CSV), asi que puedes copiar la salida
+ *   del monitor serial directo a tu script de analisis. La "x" exportada es el
+ *   angulo comandado en grados (no la posicion); la posicion en cm se imprime
+ *   aparte, en la misma linea, para que ubiques a ojo el punto de arranque.
+ */
+
+#include <Arduino.h>
+#include <ESP32Servo.h>
+
+// ====================== CONFIGURACION DE HARDWARE ======================
+#define SERVO_PIN     13      // <-- AJUSTAR: pin PWM del servo (tu PID usaba 2, el servo funcional usaba 13)
+#define SENSOR_PIN    34      // ADC1, solo entrada (cable amarillo del Sharp)
+
+// Rango de pulsos del servo (los mismos del attach del codigo funcional)
+const int US_PULSO_MIN = 500;     // limite inferior fisico del servo
+const int US_PULSO_MAX = 2500;    // limite superior fisico del servo
+const int US_CENTRO    = 1420;    // viga nivelada (u = 0 rad)
+
+// Clamp de seguridad mecanica (no dejar que el brazo golpee los topes)
+const int US_MIN_SEG   = 950;     // viga satura mecanicamente a ~900 us (+2.97 deg)
+const int US_MAX_SEG   = 1900;    // <-- AJUSTAR
+
+// ====================== SENSOR SHARP (calibrado) =======================
+#define N_MUESTRAS   20       // lecturas a promediar por ciclo
+#define ALPHA        0.15f    // filtro pasa-bajos: menor = mas suave (mas lag), mayor = mas rapido
+
+// Tabla de calibracion (ordenada por distancia creciente => ADC decreciente)
+const int   N_PTS = 19;
+const float dist_cm[N_PTS] = { 3,    5,    7,    9,    11,   13,   15,   17,   19,   21,
+                               23,   25,   27,   29,   31,   33,   35,   37,   39 };
+const float adc_val[N_PTS] = { 2760, 2350, 1940, 1680, 1470, 1360, 1190, 1080, 970,  895,
+                               820,  760,  710,  660,  620,  600,  570,  540,  516 };
+
+// Centro fisico del beam en cm (distancia sensor -> centro de la viga).
+const float CENTRO_CM = 22.5f;
+
+// El Sharp mide hasta el BORDE de la bola (cara cercana al sensor).
+// Sumando el radio obtenemos la distancia al CENTRO real de la bola.
+const float RADIO_BOLA_CM = 2.0f;   // <-- AJUSTAR: radio real de tu bola (diametro/2)
+
+float distFiltrada = 0.0f;
+bool  primeraLectura = true;
+
+// ====================== MAPPING SERVO (calibrado con medicion real) =====
+// us = US_CENTRO - DEG_A_US * angulo_deg
+// Obtenido de regresion lineal sobre 11 puntos medidos con transportador.
+const float DEG_A_US = 134.78f;  // microsegundos de pulso por cada grado de viga
+
+// ====================== VARIABLES DEL PID ==============================
+// === Aqui es donde vas a variar tus parametros (posicion en METROS) ===
+// PID en FORMA POSICIONAL:  u = Kp*e + Ki*integral + Kd*derivada
+float Kp = -0.30f;           // wn = sqrt(K*Kp) = 1.22 rad/s
+float Ki = -0.0f;
+float Kd = -0.45f;           // zeta = K*Kd / (2*wn) = 0.92  (bien amortiguado)
+float Ts = 0.05f;            // Tiempo de muestreo (50 ms)
+
+// Estado del PID posicional
+float integral = 0.0f;       // acumulador del termino integral
+float e_prev   = 0.0f;       // error anterior (para la derivada)
+float referencia_m = 0.0f;   // mantener la bola en el centro (0 m)
+
+// Filtro de la derivada (LPF de primer orden sobre dE/dt)
+// Sin esto, el ruido del Sharp se amplifica directamente por Kd.
+const float ALPHA_D = 0.30f; // 0.30 = filtro moderado. Bajar si la derivada sigue ruidosa.
+float derivadaFiltrada = 0.0f;
+
+// Anti-windup por back-calculation: cuanto se "descarga" la integral
+// cuando la salida satura. 0 = sin anti-windup. Tipico ~1/Ts.
+float Kaw = 1.0f / 0.05f;    // = 1/Ts
+
+// ====================== COMPENSACION DE FRICCION (Coulomb) =============
+// Empujon fijo (feedforward) para romper la friccion estatica.
+float U_COULOMB = 0.0f;//0.06f;   //set to 0.30  // rad: magnitud del empujon (~3.4 deg). 0 = desactivado.
+float E_BANDA   = 0.005f;    // m: banda muerta de error (+-5 mm). Dentro no empuja ni integra.
+float V_PARADA  = 0.020f;    // m/s: umbral de "bola detenida". Solo empuja si va mas lento.
+float E_SUAVE   = 0.010f;    // m: ancho para suavizar el signo (tanh) y evitar chattering.
+
+float velFiltrada = 0.0f;    // velocidad de la bola filtrada (para el gating)
+
+// ====================== MODO DE CALIBRACION DE COULOMB =================
+// Rampa lenta de angulo en lazo abierto para medir el angulo de arranque.
+volatile bool  g_modo_calibracion = false;  // false = PID normal, true = rampa
+volatile int   g_signo_rampa      = 1;      // +1 o -1 (sentido de la rampa)
+const float    TASA_RAMPA_DEG_S   = 0.5f;   // velocidad de la rampa (deg/s). Lenta a proposito.
+const float    ANGULO_MAX_RAMPA   = 3.5f;   // tope de seguridad (rango real de viga ~3.6 deg)
+float          g_angulo_rampa_deg = 0.0f;   // angulo acumulado de la rampa actual
+float          g_t_rampa          = 0.0f;   // tiempo acumulado de la rampa actual (para el log)
+bool           g_rampa_recien_iniciada = true; // para imprimir "TRIAL" al arrancar
+
+// ====================== TELEMETRIA (para imprimir en loop) =============
+volatile float g_dist_cm = 0.0f;
+volatile float g_pos_m   = 0.0f;
+volatile float g_error_m = 0.0f;
+volatile float g_u_rad   = 0.0f;
+volatile int   g_pulso_us = US_CENTRO;
+volatile float g_vel     = 0.0f;
+volatile float g_coulomb = 0.0f;
+
+// ====================== OBJETOS / PROTOTIPOS ===========================
+Servo servo;
+void  vControlTask(void *pvParameters);
+void  procesarComando(String cmd);
+
+// Buffer no-bloqueante para parser de comandos por Serial
+String serialBuffer = "";
+
+// Mapeo en punto flotante
+float map_float(float x, float in_min, float in_max, float out_min, float out_max) {
+  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+
+// Promedio crudo del ADC
+float leerADC() {
+  long suma = 0;
+  for (int i = 0; i < N_MUESTRAS; i++) {
+    suma += analogRead(SENSOR_PIN);
+    delayMicroseconds(200);
+  }
+  return suma / (float)N_MUESTRAS;
+}
+
+// ADC -> distancia (cm) por interpolacion lineal entre puntos de la tabla
+float adcADistancia(float adc) {
+  if (adc >= adc_val[0])        return dist_cm[0];          // bola muy cerca / saturado
+  if (adc <= adc_val[N_PTS-1])  return dist_cm[N_PTS-1];    // bola lejos / fuera de rango
+  for (int i = 0; i < N_PTS - 1; i++) {
+    if (adc <= adc_val[i] && adc >= adc_val[i+1]) {
+      float t = (adc - adc_val[i]) / (adc_val[i+1] - adc_val[i]);
+      return dist_cm[i] + t * (dist_cm[i+1] - dist_cm[i]);
+    }
+  }
+  return -1.0f;  // no deberia ocurrir
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // --- ADC del Sharp ---
+  analogReadResolution(12);          // 0 - 4095
+  analogSetAttenuation(ADC_11db);    // rango de entrada ~0 - 3.3 V
+
+  // --- Forma posicional: no hay constantes q0/q1/q2 que precalcular ---
+
+  // --- Servo (libreria ESP32Servo, codigo funcional) ---
+  servo.setPeriodHertz(50);                          // 50 Hz (20 ms)
+  servo.attach(SERVO_PIN, US_PULSO_MIN, US_PULSO_MAX);
+  servo.writeMicroseconds(US_CENTRO);                // arranca centrado
+  delay(1000);
+
+  // --- Tarea de control anclada al Core 1 ---
+  xTaskCreatePinnedToCore(
+    vControlTask,   // Funcion de la tarea
+    "Control_PID",  // Nombre
+    4096,           // Tamano de pila
+    NULL,           // Parametros
+    1,              // Prioridad
+    NULL,           // Handle
+    1               // Core 1 (Core 0 maneja WiFi/BT si se usan)
+  );
+
+  // --- Ayuda en consola ---
+  Serial.println();
+  Serial.println("# === Ball and Beam - Comandos disponibles ===");
+  Serial.println("#   c          : rampa de calibracion Coulomb (sentido +)");
+  Serial.println("#   n          : rampa de calibracion Coulomb (sentido -)");
+  Serial.println("#   p          : volver a modo PID");
+  Serial.println("#   kp=<val>   : fijar Kp     (ej: kp=-0.30)");
+  Serial.println("#   kd=<val>   : fijar Kd     (ej: kd=-0.45)");
+  Serial.println("#   ki=<val>   : fijar Ki     (resetea integral)");
+  Serial.println("#   cb=<val>   : fijar U_COULOMB en radianes (ej: cb=0.015)");
+  Serial.println("#   i          : reset integral");
+  Serial.println("#   ?          : imprimir parametros actuales");
+  Serial.println("# ============================================");
+}
+
+void loop() {
+  // --- Comandos via Serial (parser de lineas, no bloqueante) ---
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (serialBuffer.length() > 0) {
+        procesarComando(serialBuffer);
+        serialBuffer = "";
+      }
+    } else {
+      serialBuffer += c;
+      if (serialBuffer.length() > 64) serialBuffer = "";  // overflow guard
+    }
+  }
+
+  // El loop queda libre para imprimir datos o recibir nuevos Kp, Ki, Kd via Serial/WiFi
+  if (g_modo_calibracion) {
+    // Log en formato TRIAL / t,x  -- CSV puro, 100% compatible con tu script de Python.
+    // x = angulo comandado en grados (no la posicion). La posicion va en una linea
+    // de telemetria separada (con '#' al inicio) que tu parser ignora porque no
+    // tiene un patron "numero,numero" valido en split(',').
+    if (g_rampa_recien_iniciada) {
+      Serial.println("TRIAL");
+      g_rampa_recien_iniciada = false;
+    }
+    Serial.print(g_t_rampa, 4);
+    Serial.print(",");
+    Serial.println(g_angulo_rampa_deg, 4);
+    Serial.print("# Pos_cm: ");
+    Serial.print(g_pos_m * 100.0f, 3);
+    Serial.print("  Pulso_us: ");
+    Serial.println(g_pulso_us);
+  } else {
+    Serial.print("Dist: ");  Serial.print(g_dist_cm, 2);
+    Serial.print(" cm\tPos: "); Serial.print(g_pos_m * 100.0f, 2);
+    Serial.print(" cm\tErr: "); Serial.print(g_error_m * 100.0f, 2);
+    Serial.print(" cm\tu: ");   Serial.print(g_u_rad, 3);
+    Serial.print(" rad\tVel: "); Serial.print(g_vel, 3);
+    Serial.print(" m/s\tCoul: "); Serial.print(g_coulomb, 3);
+    Serial.print("\tPulso: "); Serial.print(g_pulso_us);
+    Serial.println(" us");
+  }
+  vTaskDelay(pdMS_TO_TICKS(100));
+}
+
+// ====================== TAREA DE CONTROL EN TIEMPO REAL ================
+void vControlTask(void *pvParameters) {
+  const TickType_t xFrecuenciaMuestreo = pdMS_TO_TICKS((uint32_t)(Ts * 1000.0f));
+  TickType_t xUltimoDespertar = xTaskGetTickCount();
+
+  for (;;) {
+    // ---- Lectura del sensor Sharp (comun a ambos modos) ----
+    float adc  = leerADC();
+    float dist = adcADistancia(adc);
+
+    if (dist >= 0.0f) {
+      if (primeraLectura) { distFiltrada = dist; primeraLectura = false; }
+      else                { distFiltrada = ALPHA * dist + (1.0f - ALPHA) * distFiltrada; }
+    }
+
+    float dist_centro_cm = distFiltrada + RADIO_BOLA_CM;
+    float posicion_m = (dist_centro_cm - CENTRO_CM) / 100.0f;
+
+    if (g_modo_calibracion) {
+      // ================= MODO RAMPA: lazo abierto, sin PID =================
+      // Sube el angulo MUY lento hasta que detectes movimiento en Pos_cm,
+      // o hasta el tope de seguridad ANGULO_MAX_RAMPA (se autodetiene).
+      g_angulo_rampa_deg += g_signo_rampa * TASA_RAMPA_DEG_S * Ts;
+      g_t_rampa += Ts;
+
+      if (fabsf(g_angulo_rampa_deg) > ANGULO_MAX_RAMPA) {
+        g_modo_calibracion = false;  // abortar: no arranco dentro del rango seguro
+        Serial.println("# ABORTADO: se alcanzo ANGULO_MAX_RAMPA sin que la bola arrancara.");
+        Serial.println("# Revisa mecanica/sensor, o sube ANGULO_MAX_RAMPA si es necesario.");
+      }
+
+      float pulso_us = (float)US_CENTRO - DEG_A_US * g_angulo_rampa_deg;
+      float pulso_sat = pulso_us;
+      if (pulso_sat > US_MAX_SEG) pulso_sat = US_MAX_SEG;
+      if (pulso_sat < US_MIN_SEG) pulso_sat = US_MIN_SEG;
+
+      servo.writeMicroseconds((int)pulso_sat);
+
+      // Telemetria (reusa las mismas variables globales)
+      g_dist_cm  = distFiltrada;
+      g_pos_m    = posicion_m;
+      g_u_rad    = g_angulo_rampa_deg * (1.0f / 57.2958f);
+      g_pulso_us = (int)pulso_sat;
+
+      // Mantener limpio el estado del PID para cuando se vuelva al modo normal
+      integral = 0.0f;
+      e_prev   = referencia_m - posicion_m;
+      velFiltrada = 0.0f;
+      derivadaFiltrada = 0.0f;
+
+    } else {
+      // ================= MODO PID NORMAL (igual que antes) =================
+      float e_actual = referencia_m - posicion_m;
+
+      // Derivada cruda + LPF (evita amplificar el ruido del Sharp por Kd)
+      float derivada_cruda = (e_actual - e_prev) / Ts;
+      derivadaFiltrada = ALPHA_D * derivada_cruda + (1.0f - ALPHA_D) * derivadaFiltrada;
+
+      if (fabsf(e_actual) > E_BANDA) {
+        integral += e_actual * Ts;
+      }
+
+      float u_pid = (Kp * e_actual) + (Ki * integral) + (Kd * derivadaFiltrada);
+
+      float vel_inst = -derivadaFiltrada;
+      velFiltrada = 0.3f * vel_inst + 0.7f * velFiltrada;
+
+      float u_coulomb = 0.0f;
+      if (fabsf(e_actual) > E_BANDA && fabsf(velFiltrada) < V_PARADA) {
+        float dir = tanhf((Kp * e_actual) / (fabsf(Kp) * E_SUAVE));
+        u_coulomb = U_COULOMB * dir;
+      }
+
+      float u_actual = u_pid + u_coulomb;
+
+      float angulo_deg = u_actual * 57.2958f;
+      float pulso_us   = (float)US_CENTRO - DEG_A_US * angulo_deg;
+
+      float pulso_sat = pulso_us;
+      if (pulso_sat > US_MAX_SEG) pulso_sat = US_MAX_SEG;
+      if (pulso_sat < US_MIN_SEG) pulso_sat = US_MIN_SEG;
+
+      if (pulso_sat != pulso_us && Ki != 0.0f) {
+        float u_sat = -(((pulso_sat - (float)US_CENTRO) / DEG_A_US)) / 57.2958f;
+        integral += (Kaw * (u_sat - u_actual) * Ts) / Ki;
+      }
+
+      servo.writeMicroseconds((int)pulso_sat);
+
+      g_dist_cm  = distFiltrada;
+      g_pos_m    = posicion_m;
+      g_error_m  = e_actual;
+      g_u_rad    = u_actual;
+      g_pulso_us = (int)pulso_sat;
+      g_vel      = velFiltrada;
+      g_coulomb  = u_coulomb;
+
+      e_prev = e_actual;
+
+      // Mantener limpio el estado de la rampa para cuando se entre a calibracion
+      g_angulo_rampa_deg = 0.0f;
+      g_t_rampa = 0.0f;
+    }
+
+    vTaskDelayUntil(&xUltimoDespertar, xFrecuenciaMuestreo);
+  }
+}
+
+// ====================== PARSER DE COMANDOS POR SERIAL ==================
+// Acepta una linea completa (sin el \n). Insensible a mayusculas.
+// Asignaciones: "kp=-0.30" o "kp -0.30" (= o espacio).
+void procesarComando(String cmd) {
+  cmd.trim();
+  cmd.toLowerCase();
+  if (cmd.length() == 0) return;
+
+  // --- Modos (un solo caracter) ---
+  if (cmd == "c") {
+    g_signo_rampa = 1;
+    g_angulo_rampa_deg = 0.0f;
+    g_t_rampa = 0.0f;
+    g_rampa_recien_iniciada = true;
+    g_modo_calibracion = true;
+    Serial.println("# Iniciando rampa de calibracion Coulomb (sentido +)");
+    return;
+  }
+  if (cmd == "n") {
+    g_signo_rampa = -1;
+    g_angulo_rampa_deg = 0.0f;
+    g_t_rampa = 0.0f;
+    g_rampa_recien_iniciada = true;
+    g_modo_calibracion = true;
+    Serial.println("# Iniciando rampa de calibracion Coulomb (sentido -)");
+    return;
+  }
+  if (cmd == "p") {
+    g_modo_calibracion = false;
+    Serial.println("# Volviendo a modo PID normal");
+    return;
+  }
+  if (cmd == "i" || cmd == "reset") {
+    integral = 0.0f;
+    derivadaFiltrada = 0.0f;
+    Serial.println("# Integral y derivada filtrada reseteadas");
+    return;
+  }
+  if (cmd == "?" || cmd == "s" || cmd == "status") {
+    Serial.println("# --- Parametros actuales ---");
+    Serial.print("#   Kp        = "); Serial.println(Kp, 4);
+    Serial.print("#   Kd        = "); Serial.println(Kd, 4);
+    Serial.print("#   Ki        = "); Serial.println(Ki, 4);
+    Serial.print("#   U_COULOMB = "); Serial.print(U_COULOMB, 4);
+    Serial.print(" rad ("); Serial.print(U_COULOMB * 57.2958f, 2); Serial.println(" deg)");
+    Serial.print("#   integral  = "); Serial.println(integral, 4);
+    Serial.print("#   Modo      : ");
+    Serial.println(g_modo_calibracion ? "Calibracion (rampa)" : "PID");
+    return;
+  }
+
+  // --- Asignaciones "key=valor" o "key valor" ---
+  // Acepta '=' o espacio como separador.
+  int sep = cmd.indexOf('=');
+  if (sep < 0) sep = cmd.indexOf(' ');
+  if (sep > 0) {
+    String key = cmd.substring(0, sep);
+    String val = cmd.substring(sep + 1);
+    key.trim(); val.trim();
+    float v = val.toFloat();
+
+    if (key == "kp") {
+      Kp = v;
+      Serial.print("# Kp = "); Serial.println(Kp, 4);
+      return;
+    }
+    if (key == "kd") {
+      Kd = v;
+      Serial.print("# Kd = "); Serial.println(Kd, 4);
+      return;
+    }
+    if (key == "ki") {
+      Ki = v;
+      integral = 0.0f;   // limpiar para evitar saltos al cambiar de signo o ganancia
+      Serial.print("# Ki = "); Serial.print(Ki, 4);
+      Serial.println("  (integral reseteada)");
+      return;
+    }
+    if (key == "cb" || key == "coulomb") {
+      U_COULOMB = v;
+      Serial.print("# U_COULOMB = "); Serial.print(U_COULOMB, 4);
+      Serial.print(" rad ("); Serial.print(U_COULOMB * 57.2958f, 2); Serial.println(" deg)");
+      return;
+    }
+  }
+
+  Serial.print("# Comando desconocido: '"); Serial.print(cmd); Serial.println("'");
+  Serial.println("# Usa '?' para listar parametros, o lee la ayuda en setup().");
+}
