@@ -1,0 +1,133 @@
+#include <ESP32Servo.h>
+
+// =========================================================================
+// TABLA DE CALIBRACIÓN COMPLETA (Sharp GP2Y0A21)
+// =========================================================================
+const int N_PTS = 19;
+const float dist_cm[N_PTS] = { 3,    5,    7,    9,    11,   13,   15,   17,   19,   21,
+                               23,   25,   27,   29,   31,   33,   35,   37,   39 };
+const float adc_val[N_PTS] = { 2760, 2350, 1940, 1680, 1470, 1360, 1190, 1080, 970,  895,
+                               820,  760,  710,  660,  620,  600,  570,  540,  516 };
+
+// =========================================================================
+// CONFIGURACIÓN DE HARDWARE Y TIEMPO
+// =========================================================================
+const int PIN_SENSOR = 34;  // Pin analógico VP (ADC1_CH0) para el Sharp
+const int PIN_SERVO  = 13;  // Pin PWM para el servo (Actualizado según tu snippet)
+
+Servo miServo;
+const unsigned long TS_MICROS = 20000; // Ts = 20 ms (50Hz)
+unsigned long tiempoAnterior = 0;
+
+// =========================================================================
+// COEFICIENTES DEL CONTROLADOR IMP DISCRETO (Ts = 0.02s)
+// =========================================================================
+// =========================================================================
+// COEFICIENTES DEL CONTROLADOR MÁS RÁPIDO Y AGRESIVO (Ts = 0.02s)
+// =========================================================================
+const float b0 = -19.0390;
+const float b1 = 37.0193;
+const float b2 = -18.0020;
+const float a1 = -1.7094;
+const float a2 =  0.7094;
+
+// Historial de estados (Memorias del controlador)
+float e0 = 0, e1 = 0, e2 = 0; 
+float u0 = 0, u1 = 0, u2 = 0; 
+
+// =========================================================================
+// VARIABLES DEL SISTEMA Y LIMITES DE SEGURIDAD
+// =========================================================================
+float setpoint = 0.00;                 // Posición deseada en METROS (0.00 = Centro)
+const int SERVO_CENTRO_US = 1420;      // Pulso central exacto donde la barra está nivelada
+const float US_POR_GRADO = 11.111;     // (2500 - 500) / 180 grados
+
+// Límite de seguridad para el mecanismo: +/- 15 grados (Aprox. 166 us de desviación)
+const int LIMITE_US_DESVIACION = 550;  
+
+// =========================================================================
+// FUNCIÓN DE INTERPOLACIÓN LINEAL
+// =========================================================================
+float obtenerDistanciaCM(int adc_in) {
+  if (adc_in >= adc_val[0]) return dist_cm[0];
+  if (adc_in <= adc_val[N_PTS - 1]) return dist_cm[N_PTS - 1];
+  
+  for (int i = 0; i < N_PTS - 1; i++) {
+    if (adc_in <= adc_val[i] && adc_in > adc_val[i + 1]) {
+      float factor = (float)(adc_in - adc_val[i]) / (adc_val[i + 1] - adc_val[i]);
+      return dist_cm[i] + factor * (dist_cm[i + 1] - dist_cm[i]);
+    }
+  }
+  return dist_cm[N_PTS - 1]; 
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Configuración del ADC
+  analogSetAttenuation(ADC_11db); 
+  analogReadResolution(12);       
+  
+  // Inicialización de Alta Resolución para el Servo
+  miServo.setPeriodHertz(50);
+  miServo.attach(PIN_SERVO, 500, 2500);
+  miServo.writeMicroseconds(SERVO_CENTRO_US); 
+  
+  Serial.println("Controlador IMP Iniciado. Barra nivelada.");
+  tiempoAnterior = micros();
+}
+
+void loop() {
+  unsigned long tiempoActual = micros();
+
+  // Bucle temporizado estricto de 20ms
+  if (tiempoActual - tiempoAnterior >= TS_MICROS) {
+    tiempoAnterior += TS_MICROS; 
+
+    // 1. LEER ADC Y OBTENER DISTANCIA (Mapeo por tabla)
+    int adc = analogRead(PIN_SENSOR);
+    float distancia_cm = obtenerDistanciaCM(adc);
+    
+    // 2. TRADUCIR DISTANCIA A POSICIÓN FÍSICA (Metros)
+    float posicion_actual = ((distancia_cm + 2.0) - 22.5) / 100.0; 
+
+    // Filtro de seguridad: Congelar lectura si entra en zona ciega
+    if (posicion_actual <= -0.175) {
+      posicion_actual = -0.175;
+    }
+
+    // 3. CÁLCULO DEL ERROR
+    e0 = setpoint - posicion_actual;
+
+    // 4. ECUACIÓN EN DIFERENCIAS (Ley de Control)
+    u0 = -a1 * u1 - a2 * u2 + b0 * e0 + b1 * e1 + b2 * e2;
+
+    // 5. CONVERSIÓN A MICROSEGUNDOS Y SATURACIÓN
+    // Convertir radianes a grados
+    float angulo_grados = u0 * (180.0 / PI);
+    
+    // Convertir grados de corrección a microsegundos 
+    int delta_us = (int)(angulo_grados * US_POR_GRADO);
+    
+    // Sumar corrección al centro y restringir para no dañar el mecanismo
+    int us_salida = SERVO_CENTRO_US - delta_us;
+    us_salida = constrain(us_salida, 
+                          SERVO_CENTRO_US - LIMITE_US_DESVIACION, 
+                          SERVO_CENTRO_US + LIMITE_US_DESVIACION);
+
+    // 6. ENVIAR SEÑAL DE ALTA RESOLUCIÓN AL SERVO
+    miServo.writeMicroseconds(us_salida);
+
+    // 7. ACTUALIZAR HISTORIAL DE ESTADOS
+    e2 = e1;
+    e1 = e0;
+    u2 = u1;
+    u1 = u0;
+
+    // 8. TELEMETRÍA 
+    // Imprimimos la posición multiplicada por 100 para verla fácil en cm en el Plotter
+    Serial.print("Ref:");  Serial.print(setpoint * 100); 
+    Serial.print(",Pos:"); Serial.print(posicion_actual * 100); 
+    Serial.print(",Pulse:"); Serial.println(us_salida); 
+  }
+}
